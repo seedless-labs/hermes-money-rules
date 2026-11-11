@@ -1,0 +1,32 @@
+name: money-rules
+version: 0.1.0
+description: >-
+  money rules for hermes. connect your solana wallet once with a usdc spending cap you sign,
+  then tell hermes when to pay, split, sweep or chase money. gasless, stablecoins only,
+  every rule waits for your /money approve, and your usdc stays in your wallet until a rule pays.
+author: seedless
+pip_dependencies:
+  - solders>=0.21
+provides_tools:
+  - money_status
+  - money_connect
+  - money_pay
+  - money_rule_add
+  - money_rule_list
+  - money_request
+  - money_history
+provides_hooks:
+  - pre_llm_call
+config_schema:
+  base:
+    type: str
+    required: false
+    description: relay + connect page (default https://hermes-money-rules.vercel.app)
+  rpc_url:
+    type: str
+    required: false
+    description: your own solana rpc url (default uses the relay's rpc proxy)
+  interval:
+    type: int
+    required: false
+    description: seconds between wallet checks (default 30)
