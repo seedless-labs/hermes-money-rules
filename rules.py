@@ -129,7 +129,7 @@ def build(kind: str, when: dict, action: dict) -> tuple[dict, dict]:
 def describe(rule: dict, names: Optional[dict] = None) -> str:
     """one plain line a person can approve: 'every monthly on the 1st at 09:00: pay $500.00 to landlord (7xKX…Ab3c)'."""
     names = names or {}
-    n = lambda a: f"{names[a]} ({a[:4]}…{a[-4:]})" if a in names else f"{a[:4]}…{a[-4:]}"
+    n = lambda a: f"{names[a]} ({a[:4]}…{a[-4:]})" if a in names else a  # not saved: show all of it
     s, a, k = rule["spec"], rule["action"], rule["kind"]
     if k == "time":
         when = f"every {s['every'].replace('every ', '')}"

@@ -27,6 +27,14 @@ then talk to hermes: "pay my landlord $500 on the 1st at 9am", "when usdc comes 
 - do: `pay` an amount · `split` incoming money by % (up to 4 people) · `sweep` everything over a kept amount · `alert` you.
 - low-balance rules can only alert. every payment goes through one path and is checked against your on-chain cap.
 
+## what keeps it safe
+
+- every payment hermes starts from chat goes through the hermes approval prompt first, whoever the payee and whatever the amount. the prompt shows the amount and the full address.
+- a payee you haven't saved with `/money allow` is always shown by its full address.
+- the relay fee has a ceiling on your side: `max_fee_usd` (default 0.05) per payment, plus `max_account_fee_usd` (default 0.60) for each recipient who has no usdc account yet, since the relay funds that account's rent. a quote over the ceiling is refused and nothing is sent.
+- the fee counts toward your daily cap along with the amount.
+- if several hermes processes run at once, only one watcher works at a time (`watcher.lock`) and each rule run is claimed in the database, so a rule pays once.
+
 ## what it does that you should know
 
 - network: talks to the relay at hermes-money-rules.vercel.app (connect page, fee co-sign, read-only solana rpc proxy) or your own `rpc_url`.

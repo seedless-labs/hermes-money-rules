@@ -7,16 +7,24 @@ from __future__ import annotations
 
 import threading
 import time
+from contextlib import contextmanager
 from typing import Callable, Optional
 
 try:
     from . import rules as R
-    from .solana_tx import Client, MoneyError, pubkey, send_pay, usd, pay_link
+    from .solana_tx import (DEFAULT_MAX_ACCOUNT_FEE, DEFAULT_MAX_FEE, Client, MoneyError, pubkey, send_pay, usd,
+                            pay_link, usdc_account)
     from .store import Store
 except ImportError:  # run as plain modules (tests)
     import rules as R  # type: ignore
-    from solana_tx import Client, MoneyError, pubkey, send_pay, usd, pay_link  # type: ignore
+    from solana_tx import (DEFAULT_MAX_ACCOUNT_FEE, DEFAULT_MAX_FEE, Client, MoneyError, pubkey, send_pay, usd,  # type: ignore
+                           pay_link, usdc_account)
     from store import Store  # type: ignore
+
+try:
+    import fcntl
+except ImportError:  # windows: the atomic claims in the store still make each rule pay once
+    fcntl = None  # type: ignore
 
 DEFAULT_DAILY_CAP = 100_000_000  # $100 a day unless you set another with /money cap
 
@@ -29,11 +37,29 @@ def tx_link(sig: str) -> str:
     return f"https://solscan.io/tx/{sig}"
 
 
+
+@contextmanager
+def only_one(folder):
+    """an exclusive lock on watcher.lock in the data dir. yields false when another hermes process holds it."""
+    if fcntl is None:
+        yield True
+        return
+    with open(folder / "watcher.lock", "w") as f:
+        try:
+            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            yield False
+            return
+        yield True
+
+
 class Money:
     """the one place money moves. rules, money_pay and /money approve all come through here."""
 
-    def __init__(self, store: Store, client: Client, notify: Callable[[str], None]):
+    def __init__(self, store: Store, client: Client, notify: Callable[[str], None],
+                 max_fee: int = DEFAULT_MAX_FEE, max_account_fee: int = DEFAULT_MAX_ACCOUNT_FEE):
         self.store, self.client, self.notify = store, client, notify
+        self.max_fee, self.max_account_fee = int(max_fee), int(max_account_fee)
         self.lock = threading.Lock()
 
     def owner(self) -> Optional[str]:
@@ -44,7 +70,7 @@ class Money:
 
     def name(self, addr: str) -> str:
         p = self.store.payee(addr)
-        return f"{p['label']} ({short(addr)})" if p and p.get("label") else short(addr)
+        return f"{p['label']} ({short(addr)})" if p and p.get("label") else addr  # not saved: show all of it
 
     def pay_now(self, payments: list[tuple[str, int]], memo: str = "", why: str = "", force: bool = False) -> dict:
         """pay or hold. returns {'paid': sig, 'fee'} or {'held': [ids]}. force skips the daily cap (a human said yes)."""
@@ -52,18 +78,25 @@ class Money:
         if not owner:
             raise MoneyError("no wallet connected yet. run /money connect <cap>")
         total = sum(m for _, m in payments)
+        new = {t for t, _ in payments if not self.client.exists(usdc_account(pubkey(t)))}
+        ceiling = self.max_fee + len(new) * self.max_account_fee  # the most this run may pay the relay
         with self.lock:
-            if not force and self.store.spent_today() + total > self.daily_cap():
+            # the fee counts toward the daily cap: reserve the amount plus the fee ceiling, settle to the real fee after
+            if not self.store.add_spent(total + ceiling, None if force else self.daily_cap()):
                 ids = [self.store.hold(to, amt, memo, why or "over today's limit") for to, amt in payments]
                 self.notify(f"holding {usd(total)} ({why or 'over your daily limit'}). "
                             + " ".join(f"/money approve p{i}" for i in ids) + " to send it")
                 return {"held": ids}
-            r = send_pay(self.client, self.store.helper(), pubkey(owner), [(pubkey(t), m) for t, m in payments],
-                         memo or None)
-            self.store.add_spent(total)
+            try:
+                r = send_pay(self.client, self.store.helper(), pubkey(owner), [(pubkey(t), m) for t, m in payments],
+                             memo or None, max_fee=ceiling)
+            except BaseException:
+                self.store.add_spent(-(total + ceiling))
+                raise
+            self.store.add_spent(int(r["fee"]) - ceiling)
             what = ", ".join(f"{usd(m)} to {self.name(t)}" for t, m in payments)
             self.store.log(f"paid {what}" + (f" ({why})" if why else ""), r["signature"])
-            self.store.put("paid_since_tick", int(self.store.get("paid_since_tick", 0)) + total + int(r["fee"]))
+            self.store.bump("paid_since_tick", total + int(r["fee"]))
             self.notify(f"paid {what}. fee {usd(r['fee'])}. {tx_link(r['signature'])}")
             return {"paid": r["signature"], "fee": r["fee"]}
 
@@ -100,7 +133,13 @@ class Watcher:
     # ---- one pass ----
 
     def tick(self, now: Optional[float] = None) -> None:
-        now = time.time() if now is None else now
+        """one pass. every hermes process that loads the plugin runs a watcher on the same money.db, so only the
+        one holding watcher.lock works; the rest skip this tick."""
+        with only_one(self.store.dir) as mine:
+            if mine:
+                self._tick(time.time() if now is None else now)
+
+    def _tick(self, now: float) -> None:
         helper = str(self.store.helper().pubkey())
         owner = self.m.owner()
         if not owner:
@@ -125,12 +164,9 @@ class Watcher:
         else:
             self.store.put("connected", True)
 
-        last = self.store.get("last_balance")
-        paid = int(self.store.get("paid_since_tick", 0))
         bal = acct["balance"]
+        last, paid = self.store.take_tick(bal)
         incoming = max(0, bal - (last - paid)) if last is not None else 0
-        self.store.put("paid_since_tick", 0)
-        self.store.put("last_balance", bal)
 
         self._requests(acct, now)
         if not live:
@@ -146,21 +182,21 @@ class Watcher:
         k, s = rule["kind"], rule["spec"]
         fire = False
         if k == "time":
-            nr = rule.get("next_run") or R.next_run(s, now)
-            if rule.get("next_run") is None:
-                self.store.set_rule(rule["id"], next_run=nr)
-            if now >= nr:
-                fire = True
-                self.store.set_rule(rule["id"], next_run=R.next_run(s, now, after_run=True))
+            nr = rule.get("next_run")
+            if nr is None:
+                nr = R.next_run(s, now)
+                if not self.store.claim_rule(rule["id"], "next_run", None, nr):
+                    return
+            if now >= nr:  # claim the run: only the process that moves next_run forward pays
+                fire = self.store.claim_rule(rule["id"], "next_run", nr, R.next_run(s, now, after_run=True))
         elif k == "incoming":
             fire = incoming > 0 and incoming >= s.get("min", 0)
         else:
             over = bal > s["amount"] if k == "above" else bal < s["amount"]
             if over and not rule["latched"]:
-                fire = True
-                self.store.set_rule(rule["id"], latched=1)
+                fire = self.store.claim_rule(rule["id"], "latched", 0, 1)
             elif not over and rule["latched"]:
-                self.store.set_rule(rule["id"], latched=0)
+                self.store.claim_rule(rule["id"], "latched", 1, 0)
         if not fire:
             return
         p = R.plan(rule, bal, incoming)

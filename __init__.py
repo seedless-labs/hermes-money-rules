@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import contextvars
 import logging
+import uuid
 from typing import Any, Optional
 
 try:
@@ -29,6 +30,7 @@ DEFAULT_AUTO_LIMIT = 0  # agent-started payments always wait for a yes unless yo
 PROMPT = """you can move usdc for the user with the money_* tools, from their own solana wallet, within a cap
 they signed. rules:
 - never claim money moved unless a tool result says "paid" with a solscan link.
+- every money_pay asks the user in the hermes approval prompt before it runs. if they say no, nothing was sent.
 - money_pay and money_rule_add usually return something the user must approve with a /money command. tell them
   the exact command. you can't approve for them.
 - amounts are usdc dollars. addresses are solana wallet addresses. if the user names a saved payee, pass the name.
@@ -45,7 +47,8 @@ class Plugin:
         self.store = store or Store()
         self.client = client or Client(self.base, cfg("rpc_url", None) or None)
         self.chat_ctx: Optional[contextvars.Context] = None
-        self.money = Money(self.store, self.client, self.notify)
+        self.money = Money(self.store, self.client, self.notify, self._fee(cfg("max_fee_usd", None), 50_000),
+                           self._fee(cfg("max_account_fee_usd", None), 600_000))
         self.watcher = Watcher(self.money, float(cfg("interval", 30) or 30))
 
     # ---- telling the user ----
@@ -73,6 +76,34 @@ class Plugin:
         return {"context": "news from money rules since the last message (tell the user):\n- " + "\n- ".join(notes)}
 
     # ---- helpers ----
+
+    @staticmethod
+    def _fee(v: Any, default: int) -> int:
+        try:
+            return max(0, int(round(float(v) * 1_000_000)))
+        except (TypeError, ValueError):
+            return default
+
+    def guard(self, tool_name: str = "", args: Any = None, **kw: Any) -> Optional[dict]:
+        """pre_tool_call: every chat-started payment goes through the hermes approval prompt, whatever the payee
+        or amount. the key is unique per call, so an 'always' answer never covers a later payment."""
+        if not str(tool_name).endswith("money_pay"):
+            return None
+        a = args if isinstance(args, dict) else {}
+        to = str(a.get("to") or "").strip()
+        try:
+            addr = self.resolve(to)
+            p = self.store.payee(addr)
+            who = f"{p['label']} ({addr})" if p and p.get("label") else addr
+        except Exception:
+            who = to or "an unknown payee"
+        try:
+            amt = usd(to_micro(a.get("amount")))
+        except Exception:
+            amt = f"{a.get('amount')} usdc"
+        memo = f", memo: {str(a['memo'])[:80]}" if a.get("memo") else ""
+        return {"action": "approve", "message": f"money rules: pay {amt} from your wallet to {who}{memo}",
+                "rule_key": f"money_pay:{kw.get('tool_call_id') or uuid.uuid4().hex}"}
 
     def resolve(self, to: str) -> str:
         to = str(to or "").strip()
@@ -239,7 +270,14 @@ class Plugin:
             if cmd == "deny":
                 self.store.set_pending(pid, "denied")
                 return f"p{pid} dropped. nothing was sent"
-            r = self.money.pay_now([(p["payto"], p["amount"])], p["memo"] or "", why=f"you approved p{pid}", force=True)
+            if not self.store.claim_pending(pid, "waiting", "sending"):  # another hermes process took it
+                return f"nothing waiting as p{pid}"
+            try:
+                r = self.money.pay_now([(p["payto"], p["amount"])], p["memo"] or "", why=f"you approved p{pid}",
+                                       force=True)
+            except BaseException:
+                self.store.claim_pending(pid, "sending", "waiting")
+                raise
             self.store.set_pending(pid, "paid", r.get("paid"))
             return f"sent {usd(p['amount'])} to {self.money.name(p['payto'])}. {tx_link(r['paid'])}"
         if cmd == "allow":
@@ -285,8 +323,9 @@ TOOLS = [
     ("money_connect", "t_connect", "🔗", "get a link the user opens to connect their solana wallet and set a spending "
      "cap. use it when money is not connected or the cap ran out.",
      {"type": "object", "properties": {"cap": {**_AMT, "description": "most usdc hermes may ever spend, in dollars"}}}),
-    ("money_pay", "t_pay", "💸", "pay usdc from the user's wallet. pays at once only for a saved payee under their "
-     "auto limit; otherwise it waits for the user's /money approve.",
+    ("money_pay", "t_pay", "💸", "pay usdc from the user's wallet. every call asks the user in the hermes approval "
+     "prompt first. after their yes it pays at once only for a saved payee under their auto limit; otherwise it "
+     "also waits for the user's /money approve.",
      {"type": "object", "properties": {"to": _ADDR, "amount": _AMT, "memo": {"type": "string"}},
       "required": ["to", "amount"]}),
     ("money_rule_add", "t_rule_add", "⚙️", "propose a money rule. it stays off until the user approves it. kinds: time "
@@ -333,6 +372,7 @@ def register(ctx: Any) -> None:
     ctx.register_command("money", p.command, description="your money rules: status, approve, connect, revoke",
                          args_hint="status|connect <cap>|approve p1|rules|revoke")
     ctx.register_hook("pre_llm_call", p.pre_llm_call)
+    ctx.register_hook("pre_tool_call", p.guard)
     ctx.register_system_prompt_section("money-rules", PROMPT)
     ctx.on_unload(p.stop)
     p.start()
