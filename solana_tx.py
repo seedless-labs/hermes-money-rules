@@ -230,9 +230,21 @@ def build_pay(helper: Keypair, owner: Pubkey, payments: list[tuple[Pubkey, int]]
     return base64.b64encode(bytes(VersionedTransaction.populate(msg, sigs))).decode()
 
 
+DEFAULT_MAX_FEE = 50_000  # $0.05: the most a relay may charge for one payment unless you raise max_fee_usd
+DEFAULT_MAX_ACCOUNT_FEE = 600_000  # $0.60 more per recipient who has no usdc account yet (the relay funds its rent)
+
+
+def _fee_ok(fee: Any, max_fee: int) -> int:
+    fee = int(fee)
+    if fee > max_fee:
+        raise MoneyError(f"the relay asked for a {usd(fee)} fee, over your {usd(max_fee)} limit. nothing was sent. "
+                         "raise max_fee_usd in the plugin settings only if you trust this relay")
+    return fee
+
+
 def send_pay(c: Client, helper: Keypair, owner: Pubkey, payments: list[tuple[Pubkey, int]],
-             memo: Optional[str] = None) -> dict:
-    """quote, rebuild at the quoted fee, send. returns {signature, fee}."""
+             memo: Optional[str] = None, max_fee: int = DEFAULT_MAX_FEE) -> dict:
+    """quote, rebuild at the quoted fee, send. returns {signature, fee}. a fee over max_fee is refused, never paid."""
     relay = c.relay()
     create = []
     for to, _ in payments:
@@ -240,7 +252,7 @@ def send_pay(c: Client, helper: Keypair, owner: Pubkey, payments: list[tuple[Pub
             create.append(to)
     acct = c.account(owner)
     total = sum(a for _, a in payments)
-    fee = int(relay.get("fee_floor", 10_000))
+    fee = _fee_ok(relay.get("fee_floor", 10_000), max_fee)
     if acct["delegate"] != str(helper.pubkey()):
         raise MoneyError("hermes isn't connected to this wallet anymore. run /money connect")
     for attempt in range(2):
@@ -250,11 +262,11 @@ def send_pay(c: Client, helper: Keypair, owner: Pubkey, payments: list[tuple[Pub
             q = c.relay_post(wire, dry=True)
         except MoneyError as e:
             if getattr(e, "fee", None):
-                fee = int(e.fee)  # type: ignore[attr-defined]
+                fee = _fee_ok(e.fee, max_fee)  # type: ignore[attr-defined]
                 continue
             raise
         if int(q["fee"]) > fee:
-            fee = int(q["fee"])
+            fee = _fee_ok(q["fee"], max_fee)
             wire = build_pay(helper, owner, payments, fee, relay, bh, create, memo)
         if total + fee > acct["allowance"]:
             raise MoneyError(f"over your cap: {usd(total + fee)} needed, {usd(acct['allowance'])} left. "

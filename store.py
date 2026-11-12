@@ -11,6 +11,7 @@ import sqlite3
 import stat
 import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Optional
 
@@ -48,6 +49,18 @@ class Store:
         self.db.execute("pragma journal_mode=wal")
         self.db.executescript(SCHEMA)
         self.lock = threading.RLock()
+
+    @contextmanager
+    def tx(self):
+        """one write transaction. holds sqlite's write lock, so it is safe across processes sharing money.db."""
+        with self.lock:
+            self.db.execute("begin immediate")
+            try:
+                yield
+            except BaseException:
+                self.db.execute("rollback")
+                raise
+            self.db.execute("commit")
 
     # ---- helper key ----
 
@@ -95,6 +108,13 @@ class Store:
         with self.lock:
             self.db.execute(f"update rules set {cols} where id=?", (*fields.values(), rid))
 
+    def claim_rule(self, rid: int, col: str, old: Any, new: Any) -> bool:
+        """move next_run or latched from old to new. true for exactly one caller, however many processes race."""
+        if col not in ("next_run", "latched"):
+            raise ValueError(col)
+        with self.lock:
+            return self.db.execute(f"update rules set {col}=? where id=? and {col} is ?", (new, rid, old)).rowcount == 1
+
     def delete_rule(self, rid: int) -> bool:
         with self.lock:
             return self.db.execute("delete from rules where id=?", (rid,)).rowcount > 0
@@ -136,6 +156,11 @@ class Store:
         with self.lock:
             self.db.execute("update pending set status=?, sig=? where id=?", (status, sig, pid))
 
+    def claim_pending(self, pid: int, old: str, new: str) -> bool:
+        """move a held payment from one status to another. true for exactly one caller."""
+        with self.lock:
+            return self.db.execute("update pending set status=? where id=? and status=?", (new, pid, old)).rowcount == 1
+
     # ---- requests ----
 
     def add_request(self, reference: str, amount: int, label: str, memo: str, every_s: Optional[int]) -> None:
@@ -158,12 +183,27 @@ class Store:
         d = self.get("spent", {})
         return int(d.get(day, 0))
 
-    def add_spent(self, micro: int) -> None:
+    def add_spent(self, micro: int, cap: Optional[int] = None) -> bool:
+        """count micro toward today's spend in one transaction. with a cap, refuses (false) when it would go over."""
         day = time.strftime("%Y-%m-%d", time.gmtime())
-        with self.lock:
-            d = {k: v for k, v in self.get("spent", {}).items() if k == day}
-            d[day] = int(d.get(day, 0)) + int(micro)
-            self.put("spent", d)
+        with self.tx():
+            now = int(self.get("spent", {}).get(day, 0))
+            if cap is not None and now + int(micro) > cap:
+                return False
+            self.put("spent", {day: max(0, now + int(micro))})
+            return True
+
+    def bump(self, k: str, n: int) -> None:
+        with self.tx():
+            self.put(k, int(self.get(k, 0)) + int(n))
+
+    def take_tick(self, bal: int) -> tuple:
+        """read (last_balance, paid_since_tick) and reset them for the next tick, in one transaction."""
+        with self.tx():
+            last, paid = self.get("last_balance"), int(self.get("paid_since_tick", 0))
+            self.put("paid_since_tick", 0)
+            self.put("last_balance", bal)
+            return last, paid
 
     def log(self, what: str, sig: Optional[str] = None) -> None:
         with self.lock:

@@ -1,5 +1,5 @@
 name: money-rules
-version: 0.1.0
+version: 0.2.0
 description: >-
   money rules for hermes. connect your solana wallet once with a usdc spending cap you sign,
   then tell hermes when to pay, split, sweep or chase money. gasless, stablecoins only,
@@ -17,6 +17,7 @@ provides_tools:
   - money_history
 provides_hooks:
   - pre_llm_call
+  - pre_tool_call
 config_schema:
   base:
     type: str
@@ -30,3 +31,11 @@ config_schema:
     type: int
     required: false
     description: seconds between wallet checks (default 30)
+  max_fee_usd:
+    type: float
+    required: false
+    description: most the relay may charge for one payment, in dollars (default 0.05). a higher quote is refused
+  max_account_fee_usd:
+    type: float
+    required: false
+    description: extra fee allowed per recipient with no usdc account yet, in dollars (default 0.60)
