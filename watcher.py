@@ -105,6 +105,7 @@ class Watcher:
     def __init__(self, money: Money, interval: float = 30):
         self.m, self.store, self.client = money, money.store, money.client
         self.interval = interval
+        self.skipped: set = set()  # rules whose skip is already logged
         self.stop_ev = threading.Event()
         self.thread: Optional[threading.Thread] = None
         self.fails = 0
@@ -174,13 +175,14 @@ class Watcher:
         for rule in self.store.rules(enabled_only=True):
             try:
                 self._rule(rule, bal, incoming, now)
-            except MoneyError as e:
-                self.m.notify(f"rule r{rule['id']} didn't run: {e}")
-                self.store.log(f"rule r{rule['id']} failed: {e}")
+            except Exception as e:  # one bad rule never stops the others
+                why = str(e) if isinstance(e, MoneyError) else f"{type(e).__name__}: {e}"
+                self.m.notify(f"rule r{rule['id']} didn't run: {why}")
+                self.store.log(f"rule r{rule['id']} failed: {why}")
 
     def _rule(self, rule: dict, bal: int, incoming: int, now: float) -> None:
         k, s = rule["kind"], rule["spec"]
-        fire = False
+        fire = latch = False
         if k == "time":
             nr = rule.get("next_run")
             if nr is None:
@@ -194,18 +196,32 @@ class Watcher:
         else:
             over = bal > s["amount"] if k == "above" else bal < s["amount"]
             if over and not rule["latched"]:
-                fire = self.store.claim_rule(rule["id"], "latched", 0, 1)
+                fire = latch = self.store.claim_rule(rule["id"], "latched", 0, 1)  # the claim picks one process
             elif not over and rule["latched"]:
                 self.store.claim_rule(rule["id"], "latched", 1, 0)
+            if not over:
+                self.skipped.discard(rule["id"])
         if not fire:
             return
-        p = R.plan(rule, bal, incoming)
+        try:
+            p = R.plan(rule, bal, incoming)
+        except BaseException:
+            if latch:  # no plan, so nothing was sent: give the latch back so a later tick tries again
+                self.store.claim_rule(rule["id"], "latched", 1, 0)
+            raise
         if "alert" in p:
             self.m.notify(f"r{rule['id']}: {p['alert']}")
             self.store.log(f"rule r{rule['id']} alert")
         elif "skip" in p:
+            if latch:  # a skipped sweep is not a run: stay unlatched and try again next tick
+                self.store.claim_rule(rule["id"], "latched", 1, 0)
+                if rule["id"] in self.skipped:
+                    return
+                self.skipped.add(rule["id"])
             self.store.log(f"rule r{rule['id']} skipped: {p['skip']}")
-        else:
+            return
+        self.skipped.discard(rule["id"])
+        if "pay" in p:  # a send that fails stays latched: it may have landed, so it is never retried blind
             self.m.pay_now(p["pay"], p.get("memo", ""), why=f"rule r{rule['id']}")
 
     def _requests(self, acct: dict, now: float) -> None:

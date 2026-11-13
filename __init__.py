@@ -37,6 +37,12 @@ they signed. rules:
 - if money is not connected, call money_connect and give them the link."""
 
 
+def exact(micro: int) -> str:
+    """micro usdc as a plain decimal, no rounding."""
+    whole, frac = divmod(int(micro), 1_000_000)
+    return f"{whole}.{frac:06d}".rstrip("0").rstrip(".")
+
+
 class Plugin:
     """everything register() wires up. kept as an object so tests can drive it without hermes."""
 
@@ -107,7 +113,10 @@ class Plugin:
 
     def resolve(self, to: str) -> str:
         to = str(to or "").strip()
-        p = self.store.payee_by_label(to)
+        try:
+            p = self.store.payee_by_label(to)
+        except LookupError as e:
+            raise MoneyError(f"more than one saved payee is called '{to}'. use the address instead") from e
         if p:
             return p["address"]
         try:
@@ -122,7 +131,7 @@ class Plugin:
         helper = str(self.store.helper().pubkey())
         if revoke:
             return f"{self.base}/?do=revoke&helper={helper}"
-        return f"{self.base}/?do=connect&helper={helper}&cap={to_micro(cap or 100) / 1_000_000:g}"
+        return f"{self.base}/?do=connect&helper={helper}&cap={exact(to_micro(cap or 100))}"
 
     def status(self) -> str:
         owner = self.money.owner()
@@ -163,6 +172,8 @@ class Plugin:
             return f"error: {e}"
         except (KeyError, TypeError, ValueError) as e:
             return f"error: bad arguments ({e})"
+        except Exception as e:  # nothing a tool raises reaches the host
+            return f"error: {type(e).__name__}: {e}"
 
     def t_status(self) -> str:
         return self.status() + "\n" + self.rules_text()
@@ -233,6 +244,8 @@ class Plugin:
             return f"error: {e}"
         except (IndexError, ValueError):
             return HELP
+        except Exception as e:  # nothing a command raises reaches the host
+            return f"error: {type(e).__name__}: {e}"
 
     def _id(self, s: str, letter: str) -> int:
         s = s.lower()
@@ -284,7 +297,10 @@ class Plugin:
             addr = str(pubkey(rest[0]))
             limit = to_micro(rest[1]) if len(rest) > 1 else 0
             label = " ".join(rest[2:])[:40]
-            self.store.allow(addr, limit, label)
+            try:
+                self.store.allow(addr, limit, label)
+            except ValueError as e:
+                raise MoneyError(f"another saved payee is already called '{label}'. pick a different name") from e
             return (f"saved {label or short(addr)}. hermes may pay them up to {usd(limit)} at a time without asking"
                     if limit else f"saved {label or short(addr)}. every payment to them still asks you first")
         if cmd == "cap":

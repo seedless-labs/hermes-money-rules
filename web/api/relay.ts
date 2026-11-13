@@ -8,6 +8,7 @@ import {
   getCompiledTransactionMessageDecoder, createKeyPairFromBytes, getAddressFromPublicKey,
   partiallySignTransaction, getBase64EncodedWireTransaction, getSignatureFromTransaction,
 } from '@solana/kit';
+import { clientIp, limits } from './_guard.js';
 import { inspect, USDC, TOKEN, ATA, type Msg } from '../lib/check.js';
 
 const MAX_BODY = 8 * 1024;
@@ -20,16 +21,10 @@ const RPC = process.env.ALCHEMY_RPC_URL ?? 'https://api.mainnet-beta.solana.com'
 const SOL = 'So11111111111111111111111111111111111111112';
 
 const json = (body: unknown, status = 200) =>
-  new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json', 'cache-control': 'no-store', 'access-control-allow-origin': '*' } });
+  new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json', 'cache-control': 'no-store' } });
 
-const hits = new Map<string, { n: number; t: number }>();
-function allow(ip: string): boolean {
-  const now = Date.now(); const h = hits.get(ip);
-  if (!h || now - h.t > 60_000) hits.set(ip, { n: 1, t: now });
-  else if (++h.n > PER_IP_PER_MIN) return false;
-  if (hits.size > 5_000) hits.clear();
-  return true;
-}
+const allow = limits('RELAY', PER_IP_PER_MIN, 5_000);
+const allowRead = limits('RELAY_READ', 60, 20_000);
 
 let cache: { kp: CryptoKeyPair; addr: string; usdc: string } | undefined;
 async function payer() {
@@ -81,19 +76,19 @@ async function cost(wire: string, payerAddr: string) {
 let today = { d: '', n: 0n };
 
 export async function OPTIONS() {
-  return new Response(null, { status: 204, headers: { 'access-control-allow-origin': '*', 'access-control-allow-methods': 'GET, POST', 'access-control-allow-headers': 'content-type' } });
+  return new Response(null, { status: 204, headers: { 'cache-control': 'no-store' } });
 }
 
-export async function GET() {
+export async function GET(req: Request) {
   if (!process.env.HERMES_PAYER_SECRET) return json({ error: 'relay is not configured' }, 503);
+  if (!allowRead(clientIp(req))) return json({ error: 'busy, try again in a minute' }, 429);
   const p = await payer();
   return json({ payer: p.addr, payer_usdc: p.usdc, fee_floor: Number(BASE_FEE), usdc: USDC });
 }
 
 export async function POST(req: Request): Promise<Response> {
   if (!process.env.HERMES_PAYER_SECRET) return json({ error: 'relay is not configured' }, 503);
-  const ip = req.headers.get('x-real-ip') ?? req.headers.get('x-forwarded-for')?.split(',')[0]?.trim() ?? 'unknown';
-  if (!allow(ip)) return json({ error: 'busy, try again in a minute' }, 429);
+  if (!allow(clientIp(req))) return json({ error: 'busy, try again in a minute' }, 429);
   const raw = await req.arrayBuffer();
   if (raw.byteLength > MAX_BODY) return json({ error: 'body too large' }, 413);
   let body: any;

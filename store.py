@@ -122,7 +122,11 @@ class Store:
     # ---- payees ----
 
     def allow(self, address: str, limit: int, label: str = "") -> None:
+        """a label names one address. raises ValueError if another payee already has it."""
         with self.lock:
+            if label.strip() and self.db.execute("select 1 from payees where lower(label)=lower(?) and address<>?",
+                                                 (label.strip(), address)).fetchone():
+                raise ValueError(f"label taken: {label}")
             self.db.execute("insert into payees(address,label,auto_limit) values(?,?,?) on conflict(address) do update set "
                             "auto_limit=excluded.auto_limit, label=coalesce(nullif(excluded.label,''), payees.label)",
                             (address, label, limit))
@@ -132,8 +136,13 @@ class Store:
         return dict(r) if r else None
 
     def payee_by_label(self, label: str) -> Optional[dict]:
-        r = self.db.execute("select * from payees where lower(label)=lower(?)", (label.strip(),)).fetchone()
-        return dict(r) if r else None
+        """the one payee with this label. raises LookupError if older data has the label on more than one address."""
+        if not label.strip():
+            return None
+        rows = self.db.execute("select * from payees where lower(label)=lower(?)", (label.strip(),)).fetchall()
+        if len(rows) > 1:
+            raise LookupError(f"ambiguous label: {label}")
+        return dict(rows[0]) if rows else None
 
     def payees(self) -> list[dict]:
         return [dict(r) for r in self.db.execute("select * from payees order by label")]
