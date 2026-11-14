@@ -47,3 +47,14 @@ def test_describe():
     spec, act = R.build("time", {"every": "weekly", "at": "09:00"}, {"type": "pay", "to": A, "amount": "5"})
     assert R.describe({"spec": spec, "action": act, "kind": "time"}, {A: "sam"}).startswith(
         "every weekly at 09:00: pay $5.00 to sam")
+
+
+def test_split_rejects_nan_and_inf():
+    for bad in (float("nan"), float("inf"), "x", None):
+        with pytest.raises(MoneyError):
+            R.build("incoming", {}, {"type": "split", "parts": [{"to": A, "pct": bad}]})
+
+
+def test_plan_skips_a_stored_bad_share():
+    rule = {"kind": "incoming", "spec": {}, "action": {"type": "split", "parts": [{"to": A, "pct": float("nan")}]}}
+    assert "skip" in R.plan(rule, 10_000_000, 5_000_000)

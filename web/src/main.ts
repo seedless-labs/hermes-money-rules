@@ -101,7 +101,10 @@ async function pick(w: Wallet) {
     $('balance').textContent = `$${usd(a.balance)}`;
     $('current').textContent = a.delegate ? (a.delegate === helper ? `your helper, $${usd(a.allowance)} left` : `another key (${short(a.delegate)}), $${usd(a.allowance)}`) : 'none';
     if (action === 'revoke' && !a.delegate) { say('nothing to revoke. no key can spend this usdc.'); return; }
-    ($('go') as HTMLButtonElement).disabled = false;
+    // connect needs the tick: the helper key and cap come from the link, so the person confirms both on the page
+    const ok = $('ok') as HTMLInputElement;
+    const ready = () => { ($('go') as HTMLButtonElement).disabled = action === 'connect' && !ok.checked; };
+    ok.onchange = ready; ready();
     ($('go') as HTMLButtonElement).onclick = () => send(a.ata);
     say('');
   } catch (e) { say((e as Error).message, true); }
@@ -142,7 +145,10 @@ function boot() {
   if (action === 'connect') {
     $('title').textContent = `let hermes pay up to $${usd(toMicro(capText))}`;
     $('lede').textContent = 'you sign once. hermes gets a helper key that can spend your usdc up to this cap, only under rules you set in chat. your usdc stays in your wallet until a rule pays.';
-    $('helper').textContent = short(helper);
+    $('helper').textContent = helper; // the whole key, so it can be checked against what hermes printed
+    $('helper').style.wordBreak = 'break-all';
+    $('ok-row').hidden = false;
+    $('ok-text').textContent = `i asked hermes for this link. this helper key may spend up to $${usd(toMicro(capText))} of my usdc.`;
     $('cap').textContent = `$${usd(toMicro(capText))}`;
     $('go').textContent = 'sign and connect';
   } else {

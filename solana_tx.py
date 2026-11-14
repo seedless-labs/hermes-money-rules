@@ -45,7 +45,7 @@ def to_micro(value: Any) -> int:
         d = Decimal(s)
     except InvalidOperation as e:
         raise MoneyError(f"not an amount: {value}") from e
-    if d <= 0 or d != d.quantize(Decimal("0.000001")) or d > Decimal(1_000_000_000):
+    if not d.is_finite() or d <= 0 or d != d.quantize(Decimal("0.000001")) or d > Decimal(1_000_000_000):
         raise MoneyError(f"not a usdc amount: {value}")
     return int(d * 1_000_000)
 

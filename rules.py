@@ -110,10 +110,14 @@ def build(kind: str, when: dict, action: dict) -> tuple[dict, dict]:
     elif t == "split":
         if kind != "incoming":
             raise MoneyError("split shares out money that just came in, so it only works on an incoming rule")
-        parts = [{"to": str(pubkey(p["to"])), "pct": float(p["pct"])} for p in action.get("parts", [])]
+        try:
+            parts = [{"to": str(pubkey(p["to"])), "pct": float(p["pct"])} for p in action.get("parts", [])]
+        except (TypeError, ValueError, KeyError) as e:
+            raise MoneyError("each split part needs a payee and a percentage") from e
         if not 1 <= len(parts) <= 4:
             raise MoneyError("split pays 1 to 4 people")
-        if any(p["pct"] <= 0 for p in parts) or sum(p["pct"] for p in parts) > 100:
+        # written so nan and inf fail: every comparison with nan is false
+        if not all(0 < p["pct"] <= 100 for p in parts) or not sum(p["pct"] for p in parts) <= 100:
             raise MoneyError("split shares must be above 0 and add up to 100% or less")
         a = {"type": "split", "parts": parts, "memo": memo}
     elif t == "sweep":
@@ -163,6 +167,8 @@ def plan(rule: dict, balance: int, incoming: int = 0, reserve: int = 50_000) -> 
     if a["type"] == "pay":
         return {"pay": [(a["to"], a["amount"])], "memo": a.get("memo") or rule.get("label") or ""}
     if a["type"] == "split":
+        if not all(0 < p["pct"] <= 100 for p in a["parts"]):  # a rule saved before shares were checked
+            return {"skip": "a split share isn't a valid percentage. delete this rule and add it again"}
         pays = [(p["to"], int(incoming * p["pct"] / 100)) for p in a["parts"]]
         pays = [(t, m) for t, m in pays if m >= 10_000]
         if not pays:

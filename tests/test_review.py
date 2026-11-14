@@ -112,3 +112,19 @@ def test_tick_skips_while_another_process_holds_the_lock(tmp_path):
         assert not c.sent
     p.watcher.tick(due)
     assert len(c.sent) == 1
+
+
+def test_label_names_one_payee(tmp_path):
+    s = Store(tmp_path)
+    a, b = str(Keypair().pubkey()), str(Keypair().pubkey())
+    s.allow(a, 0, "rent")
+    s.allow(a, 5, "rent")  # same payee keeps its label
+    with pytest.raises(ValueError):
+        s.allow(b, 0, "RENT")
+    assert s.payee_by_label("Rent")["address"] == a
+
+
+def test_connect_cap_is_exact():
+    assert M.exact(1_234_567_890) == "1234.56789"
+    assert M.exact(100_000_000) == "100"
+    assert M.exact(1) == "0.000001"
